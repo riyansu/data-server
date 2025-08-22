@@ -5,7 +5,7 @@ use dotenv::dotenv;
 use std::{
     collections::HashMap,
     env,
-    sync::Arc,
+    sync::Arc
 };
 use serde::{Serialize, Deserialize};
 use inquire::{Select, Text};
@@ -44,8 +44,17 @@ fn calculate_ranking(final_scores: &Vec<FinalScoreEntry>, target_id: &str) -> u1
     0
 }
 
+fn set_current_dir_to_exe_location() {
+    if let Ok(exe_path) = env::current_exe() {
+        if let Some(parent) = exe_path.parent() {
+            let _ = env::set_current_dir(parent);
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
+    set_current_dir_to_exe_location();
     dotenv().expect("🚫 .env file not found");
 
     // ステージ中のスコア一時保存（id → 合計点）
