@@ -2,10 +2,13 @@ use tokio::{net::TcpListener, sync::Mutex, io::{self, BufReader, AsyncBufReadExt
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 use futures_util::{StreamExt, SinkExt};
 use dotenv::dotenv;
+
 use std::{
     collections::HashMap,
+    fs::{File},
+    io::{Write,Read},
     env,
-    sync::Arc
+    sync::{Arc, atomic::{AtomicU16, Ordering}},
 };
 use serde::{Serialize, Deserialize};
 use inquire::{Select, Text};
@@ -25,19 +28,20 @@ struct ServerMsg {
     ranking: u16,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct FinalScoreEntry {
-    id: String,
+    idx: u16,           // 内部識別用
+    id: String,         // クライアントID（表示用）
     score: u32,
     name: Option<String>,
 }
 
 /// ランキングを計算する（高スコア順）
-fn calculate_ranking(final_scores: &Vec<FinalScoreEntry>, target_id: &str) -> u16 {
+fn calculate_ranking(final_scores: &Vec<FinalScoreEntry>, target_idx: u16) -> u16 {
     let mut sorted = final_scores.clone();
     sorted.sort_by(|a, b| b.score.cmp(&a.score)); // スコア降順
     for (i, entry) in sorted.iter().enumerate() {
-        if entry.id == target_id {
+        if entry.idx == target_idx {
             return (i + 1) as u16;
         }
     }
@@ -57,10 +61,9 @@ async fn main() {
     set_current_dir_to_exe_location();
     dotenv().expect("🚫 .env file not found");
 
-    // ステージ中のスコア一時保存（id → 合計点）
     let temp_scores: Arc<Mutex<HashMap<String, u32>>> = Arc::new(Mutex::new(HashMap::new()));
-    // 終了したチームのスコア記録（FinalScoreEntryのVec）
     let final_scores: Arc<Mutex<Vec<FinalScoreEntry>>> = Arc::new(Mutex::new(Vec::new()));
+    let idx_counter: Arc<AtomicU16> = Arc::new(AtomicU16::new(0));
 
     {
         let final_scores = Arc::clone(&final_scores);
@@ -84,13 +87,58 @@ async fn main() {
                         }
                         println!("------------------------");
                     }
-                    "exit" => {
+                    "clear!" => {
+                        let mut finals = final_scores.lock().await;
+                        finals.clear();
+                    }
+                    "save" => {
+                        let finals = final_scores.lock().await;
+                        let json = serde_json::to_string_pretty(&*finals).unwrap();
+                        if let Ok(mut file) = File::create("final_scores.json") {
+                            if file.write_all(json.as_bytes()).is_ok() {
+                                println!("💾 Rankings saved to final_scores.json");
+                            } else {
+                                println!("❌ Failed to write to file.");
+                            }
+                        } else {
+                            println!("❌ Failed to create file.");
+                        }
+                    }
+                    "load" => {
+                        let mut finals = final_scores.lock().await;
+
+                        match tokio::task::spawn_blocking(|| {
+                            let mut file = File::open("final_scores.json")
+                                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send>)?;
+                            
+                            let mut contents = String::new();
+                            file.read_to_string(&mut contents)
+                                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send>)?;
+                            
+                            let parsed: Vec<FinalScoreEntry> = serde_json::from_str(&contents)
+                                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send>)?;
+                            
+                            Ok::<_, Box<dyn std::error::Error + Send>>(parsed)
+                        })
+                        .await
+                        {
+                            Ok(Ok(loaded_scores)) => {
+                                *finals = loaded_scores;
+                                println!("✅ Rankings loaded from final_scores.json");
+                            }
+                            Ok(Err(e)) => {
+                                println!("❌ Failed to load rankings: {}", e);
+                            }
+                            Err(e) => {
+                                println!("❌ Task Join Error: {}", e);
+                            }
+                        }
+                    }      
+                    "exit!" => {
                         println!("🛑 Server shutting down...");
                         std::process::exit(0);
                     }
                     "name" => {
-                        // nameコマンド処理は同期のinquireなので
-                        // Tokioのblock_in_placeで囲む
                         tokio::task::block_in_place(|| {
                             let rt = tokio::runtime::Handle::current();
                             rt.block_on(async {
@@ -100,12 +148,10 @@ async fn main() {
                                     return;
                                 }
 
-                                // トップ10をスコア順で抽出
                                 let mut sorted = finals.clone();
                                 sorted.sort_by(|a, b| b.score.cmp(&a.score));
                                 let top_n = sorted.iter().take(10).cloned().collect::<Vec<_>>();
 
-                                // 選択肢文字列の生成
                                 let options: Vec<String> = top_n.iter()
                                     .enumerate()
                                     .map(|(idx, entry)| {
@@ -124,7 +170,6 @@ async fn main() {
 
                                 match selection {
                                     Ok(selected_str) => {
-                                        // 選択された文字列の先頭番号をパースしてインデックスを取得
                                         let selected_index = selected_str.split(':').next()
                                             .and_then(|s| s.parse::<usize>().ok())
                                             .map(|i| i - 1);
@@ -134,17 +179,19 @@ async fn main() {
                                                 println!("⚠ Invalid selection index.");
                                                 return;
                                             }
-                                            // 元のfinal_scoresのインデックスを探す
                                             let target_entry = &top_n[idx];
-                                            let pos = finals.iter().position(|e| e.id == target_entry.id && e.score == target_entry.score && e.name == target_entry.name);
+                                            let pos = finals.iter().position(|e| e.idx == target_entry.idx);
                                             if let Some(pos) = pos {
-                                                // 名前入力
                                                 match Text::new("Enter a name:")
                                                     .with_placeholder("Team Name")
                                                     .prompt() {
                                                     Ok(name_input) => {
-                                                        finals[pos].name = Some(name_input.clone());
-                                                        println!("Name '{}' assigned to [{}] {}pt.", name_input, finals[pos].id, finals[pos].score);
+                                                        if name_input != "" {
+                                                            finals[pos].name = Some(name_input.clone());
+                                                            println!("Name '{}' assigned to [{}] {}pt.", name_input, finals[pos].id, finals[pos].score);
+                                                        }else {
+                                                            println!("Canceled.")
+                                                        }
                                                     }
                                                     Err(_) => {
                                                         println!("⚠ Name input cancelled or failed.");
@@ -165,7 +212,7 @@ async fn main() {
                         });
                     }
                     "help" => {
-                        println!("ranking: Show the Ranking\nname: Name Records of the Ranking\nexit: Exit the System")
+                        println!("ranking: Show the Ranking\nname: Name Records of the Ranking\nsave: Save the Ranking\nload: Load the Ranking\nclear: Clear the Ranking\nexit: Exit the System")
                     }
                     other => {
                         println!("⚠ Unknown command: {}", other);
@@ -178,11 +225,12 @@ async fn main() {
 
     let ip = env::var("IP").expect("🚫 IP not set");
     println!("WebSocket > ws://{}:9001", ip);
-    let listener = TcpListener::bind("0.0.0.0:9001").await.unwrap();
+    let listener = TcpListener::bind("172.17.98.44:9001").await.unwrap();
 
     while let Ok((stream, _)) = listener.accept().await {
         let temp_scores = Arc::clone(&temp_scores);
         let final_scores = Arc::clone(&final_scores);
+        let idx_counter = Arc::clone(&idx_counter);
 
         tokio::spawn(async move {
             let ws_stream = accept_async(stream).await.unwrap();
@@ -197,7 +245,6 @@ async fn main() {
                             let log = &client_msg;
                             let mut temp = temp_scores.lock().await;
 
-                            // スコアを加算
                             let score_entry = temp.entry(client_msg.id.clone()).or_insert(0);
                             *score_entry += client_msg.score;
 
@@ -206,24 +253,24 @@ async fn main() {
                                 log.id, log.pc, score_entry, client_msg.score
                             );
 
-                            // ステージ3終了 → 最終結果送信
                             if client_msg.pc == 3 {
                                 let total = *score_entry;
+                                drop(temp);
 
-                                // final_scores に記録
-                                drop(temp); // lock解放順に注意
+                                let idx = idx_counter.fetch_add(1, Ordering::Relaxed);
+
                                 {
                                     let mut finals = final_scores.lock().await;
                                     finals.push(FinalScoreEntry {
+                                        idx,
                                         id: client_msg.id.clone(),
                                         score: total,
                                         name: None,
                                     });
                                 }
 
-                                // ランキング算出
                                 let finals = final_scores.lock().await;
-                                let ranking = calculate_ranking(&finals, &client_msg.id);
+                                let ranking = calculate_ranking(&finals, idx);
                                 drop(finals);
 
                                 let server_msg = ServerMsg {
@@ -240,7 +287,6 @@ async fn main() {
                                 );
                                 write.send(Message::Text(json)).await.unwrap();
 
-                                // temp_scores から削除
                                 let mut temp = temp_scores.lock().await;
                                 temp.remove(&client_msg.id);
                                 println!("Remove [{}]", log.id);
