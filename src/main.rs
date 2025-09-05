@@ -4,11 +4,7 @@ use futures_util::{StreamExt, SinkExt};
 use dotenv::dotenv;
 
 use std::{
-    collections::HashMap,
-    fs::{File},
-    io::{Write,Read},
-    env,
-    sync::{Arc, atomic::{AtomicU16, Ordering}},
+    collections::HashMap, env, fs::File, io::{Read, Write}, sync::{atomic::{AtomicU16, Ordering}, Arc}
 };
 use serde::{Serialize, Deserialize};
 use inquire::{Select, Text};
@@ -75,7 +71,7 @@ async fn main() {
             while let Ok(Some(line)) = lines.next_line().await {
                 let line_trimmed = line.trim();
                 match line_trimmed.to_lowercase().as_str() {
-                    "ranking" => {
+                    "ranking"|"r" => {
                         let finals = final_scores.lock().await;
                         let mut sorted = finals.clone();
                         sorted.sort_by(|a, b| b.score.cmp(&a.score));
@@ -90,8 +86,9 @@ async fn main() {
                     "clear!" => {
                         let mut finals = final_scores.lock().await;
                         finals.clear();
+                        println!("Ranking removed.")
                     }
-                    "save" => {
+                    "save"|"s" => {
                         let finals = final_scores.lock().await;
                         let json = serde_json::to_string_pretty(&*finals).unwrap();
                         if let Ok(mut file) = File::create("final_scores.json") {
@@ -104,7 +101,7 @@ async fn main() {
                             println!("❌ Failed to create file.");
                         }
                     }
-                    "load" => {
+                    "load"|"l" => {
                         let mut finals = final_scores.lock().await;
 
                         match tokio::task::spawn_blocking(|| {
@@ -133,12 +130,16 @@ async fn main() {
                                 println!("❌ Task Join Error: {}", e);
                             }
                         }
-                    }      
+                    }     
+                    "count"|"c" => {
+                        let finals = final_scores.lock().await;
+                        println!("{}",finals.iter().len())
+                    } 
                     "exit!" => {
                         println!("🛑 Server shutting down...");
                         std::process::exit(0);
                     }
-                    "name" => {
+                    "name"|"n" => {
                         tokio::task::block_in_place(|| {
                             let rt = tokio::runtime::Handle::current();
                             rt.block_on(async {
@@ -211,8 +212,8 @@ async fn main() {
                             })
                         });
                     }
-                    "help" => {
-                        println!("ranking: Show the Ranking\nname: Name Records of the Ranking\nsave: Save the Ranking\nload: Load the Ranking\nclear: Clear the Ranking\nexit: Exit the System")
+                    "help"|"h" => {
+                        println!("ranking: Show the Ranking\nname: Name Records of the Ranking\nsave: Save the Ranking\nload: Load the Ranking\ncount: Show Counter\nclear!: Clear the Ranking\nexit!: Exit the System\n\n(Initial-Char Input Enabled.)")
                     }
                     other => {
                         println!("⚠ Unknown command: {}", other);
